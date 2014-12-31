@@ -1,0 +1,130 @@
+/*
+  dexterlau@google.com 20141017
+  Starting from FDS, find all the addresses that exist in SFDC
+  Provide full raw data as a bases for other reporting
+*/
+
+###################################################################################
+# BaseAddressDetails()
+# 	units
+# 	fiberhood
+# 	% Residential
+# 	% Commercial
+# 	% Other
+# GetInstallReadyDates()
+# GetBuildingProperties()
+# GetAddresses()
+# 	install_ready_date
+# 	project_id
+# 	address_type
+# JoinAddressesWithBuildingStats	(minUnitCount > 1)
+
+###################################################################################
+
+RUN isp_fiber_bizops_plx_gfiber_fds_address_type_rollups();
+
+DEFINE MACRO install_ready_states ('INSTALLED','PENDING_INSTALL');
+DEFINE MACRO sales_property_types ('Affordable Housing','Assisted Living / Nursing Home','Greenfield','Residential','SMB','Student Housing');
+DEFINE MACRO sales_opportunity_types ('Existing Build - Condo','Existing Build - MDU AA','Greenfield - MDU AA','MDU','MSA','MTU AA');
+
+# Apply Dremel Settings
+# MATERIALIZE '/placer/prod/home/fiberforce/reports/fibersalesdash/${YYYYMMDD}/data' AS
+SET materialize_owner_group fiberforce;
+SET accounting_group fiberforce;
+SET materialize_overwrite TRUE;
+SET min_completion_ratio 1.0;
+
+# BaseAddressDetails() of eligble address_ids
+MATERIALIZE '/cns/ic-d/home/fiberforce/smb/ttl=24/unit_counts/data' AS
+SELECT
+  															building_id,
+  															street_address,
+  EXTRACT_REGEXP(cities,"([^;]*);?.*") 						city,
+  EXTRACT_REGEXP(states,"([^;]*);?.*") 						state,	
+  															zip,
+  EXTRACT_REGEXP(project_ids,"([^;]*);?.*")			 		project_id,
+  EXTRACT_REGEXP(fiberhood_ids,"([^;]*);?.*") 				fiberhood_id,
+  EXTRACT_REGEXP(fiberhood_names,"([^;]*);?.*") 			fiberhood_name,
+  EXTRACT_REGEXP(zone_names,"([^;]*);?.*") 					zone_name,
+  EXTRACT_REGEXP(market_alias_ids,"([^;]*);?.*") 			market_alias_id,
+                                                            sfu_types_units,
+                                                            mdu_types_units, 
+                                                            sbu_types_units, 
+                                                            mtu_types_units, 
+                                                            other_types_units, 
+                                                            vacant_types_units, 
+                                                            total_units,
+FROM
+  (
+  SELECT
+    HASH(CONCAT(t2.street_address, LEFT(t2.zipcode,5)))		building_id,
+    t2.street_address										street_address, 
+    LEFT(t2.zipcode,5)										zip,
+    GROUP_CONCAT(city,";") 									cities,
+    GROUP_CONCAT(state,";") 								states,
+    GROUP_CONCAT(project_id,";") 							project_ids,
+    GROUP_CONCAT(fiberhood_id,";") 							fiberhood_ids,
+    GROUP_CONCAT(fiberhood_name,";") 						fiberhood_names,
+    GROUP_CONCAT(zone_name,";") 							zone_names,
+    GROUP_CONCAT(market_alias_id,";") 						market_alias_ids,
+    SUM(IF(address_type IN $sfu_types,1,0)) 				sfu_types_units, 
+    SUM(IF(address_type IN $mdu_types,1,0)) 				mdu_types_units, 
+    SUM(IF(address_type IN $sbu_types,1,0)) 				sbu_types_units, 
+    SUM(IF(address_type IN $mtu_types,1,0)) 				mtu_types_units, 
+    SUM(IF(address_type IN $other_types,1,0)) 				other_types_units, 
+    SUM(IF(address_type IN $vacant_types,1,0)) 				vacant_types_units, 
+    COUNT(address_type)										total_units,
+  FROM 
+    EACH (SELECT address_id, address_type, is_test, address_state, fiberhood_id, fiberhood_name, market_alias_id, zone_name, project_id FROM gfiberfds_portal_full_attributes SHUFFLE BY HASH(address_id,10)) t1
+    LEFT INNER JOIN EACH (SELECT street_address, city, state,zipcode, address_id FROM gfiberfds_street_addresses SHUFFLE BY HASH(address_id,10)) t2
+      ON t1.address_id = t2.address_id
+  WHERE
+    is_test IN ("false")
+    AND address_state NOT IN ('INELIGIBLE')
+  GROUP@10 BY
+    1,2,3
+  HAVING
+    building_id > 0
+    AND total_units > 1
+);
+
+# GetSFDCProperties()
+DEFINE TABLE unit_counts '/cns/ic-d/home/fiberforce/smb/ttl=24/unit_counts/data*';
+
+# GetBuildingProperties() of eligble address_ids
+MATERIALIZE '/cns/ic-d/home/fiberforce/smb/ttl=24/building_details/data' AS
+SELECT
+  t1.building_id											building_id,
+  t1.street_address											street_address,
+  t1.city													city,
+  t1.state													state,
+  t1.zip													zip,
+  t1.project_id												project_id,
+  t1.fiberhood_id											fiberhood_id,
+  t1.fiberhood_name											fiberhood_name,
+  t1.zone_name												zone_name,
+  t1.market_alias_id										market_alias_id,
+  t1.sfu_types_units										sfu_types_units,
+  t1.mdu_types_units										mdu_types_units, 
+  t1.sbu_types_units										sbu_types_units, 
+  t1.mtu_types_units										mtu_types_units, 
+  t1.other_types_units										other_types_units, 
+  t1.vacant_types_units										vacant_types_units, 
+  t1.total_units											total_units,
+  t2.property_ids											property_ids,
+FROM
+  					EACH (SELECT * FROM unit_counts SHUFFLE BY HASH(building_id,10)) t1
+  FULL OUTER JOIN	EACH (SELECT 
+                            HASH(CONCAT(primary_street_address__c, LEFT(primary_zip_code__c,5)))	building_id, 
+                            GROUP_CONCAT(unique_id__c,";")											property_ids,
+                          FROM edw.FIBER_SFDC_PROPERTY.newest
+                          WHERE
+                            is_deleted IS FALSE
+                            # AND LENGTH(account__c) > 0
+                            AND LENGTH(primary_street_address__c) > 0
+                            AND LENGTH(primary_zip_code__c) > 0
+                            AND (type__c IN $sales_property_types OR LENGTH(type__c) = 0)
+                            AND (opportunity_contract_type__c IN $sales_opportunity_types OR LENGTH(opportunity_contract_type__c) = 0)
+                          GROUP BY 1 
+                          SHUFFLE BY HASH(building_id,10)) t2
+    ON t1.building_id = t2.building_id;
